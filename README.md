@@ -103,11 +103,26 @@ cd HSEHack2
 
 2. **Настройте API ключ:**
    
-   Отредактируйте файл `.env`:
+   Отредактируйте/Создайте файл `.env` в корне проекта:
 ```env
-OPENROUTER_API_KEY=ваш_ключ_сюда
-USER_ID=ваш_никнейм
-CAPTURE_INTERVAL=30s  # интервал скриншотов
+# ===== ОБЩИЕ НАСТРОЙКИ =====
+USER_ID=hackathon-participant
+
+# ===== RABBITMQ =====
+# ДЛЯ ХОСТА (screener, notifier) - localhost
+RABBITMQ_URL_HOST=amqp://guest:guest@localhost:5672
+# ДЛЯ DOCKER (analyzer) - rabbitmq
+RABBITMQ_URL_DOCKER=amqp://guest:guest@rabbitmq:5672
+
+# ===== АНАЛИЗАТОР (Python) =====
+OPENROUTER_API_KEY=ваш_ключ
+MODEL_NAME=openai/gpt-4o
+POLL_INTERVAL_SECONDS=15
+DEBUG=true
+
+# ===== СКРИНШОТЕР (Go) =====
+CAPTURE_INTERVAL=30s
+
 ```
 
 3. **Запустите проект:**
