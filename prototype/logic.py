@@ -7,7 +7,7 @@ from collections import deque
 from openai import OpenAI
 from interface import show_toast
 
-OPENROUTER_API_KEY = "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"
+OPENROUTER_API_KEY = 
 MODEL_NAME = "openai/gpt-5.4"
 
 YOUR_PROMPT = """
