@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/joho/godotenv"
 	"github.com/robfig/cron/v3"
+	"github.com/streadway/amqp" // ← ДОБАВИЛИ
 )
 
 type ScreenshotData struct {
@@ -82,6 +84,12 @@ func main() {
 	// Загружаем .env если есть
 	godotenv.Load()
 
+	// ===== НАСТРОЙКИ RABBITMQ =====
+	rabbitURL := os.Getenv("RABBITMQ_URL")
+	if rabbitURL == "" {
+		rabbitURL = "amqp://guest:guest@localhost:5672" // запасной вариант
+	}
+
 	interval := os.Getenv("CAPTURE_INTERVAL")
 	if interval == "" {
 		interval = "5m"
@@ -94,13 +102,43 @@ func main() {
 
 	screenshotDir := "./screenshots"
 
+	// ===== ПОДКЛЮЧЕНИЕ К RABBITMQ =====
+	log.Printf("🔌 Подключение к RabbitMQ: %s", rabbitURL)
+
+	conn, err := amqp.Dial(rabbitURL)
+	if err != nil {
+		log.Fatal("❌ RabbitMQ connection failed:", err)
+	}
+	defer conn.Close()
+
+	ch, err := conn.Channel()
+	if err != nil {
+		log.Fatal("❌ Channel creation failed:", err)
+	}
+	defer ch.Close()
+
+	// Объявляем очередь для скриншотов
+	q, err := ch.QueueDeclare(
+		"screenshots", // название очереди
+		true,          // durable
+		false,         // delete when unused
+		false,         // exclusive
+		false,         // no-wait
+		nil,           // arguments
+	)
+	if err != nil {
+		log.Fatal("❌ Queue declaration failed:", err)
+	}
+
+	log.Printf("📦 Очередь готова: %s", q.Name)
+
 	log.Printf("📸 Screenshot service starting...")
 	log.Printf("🕒 Interval: %s", interval)
 	log.Printf("📁 Saving to: %s", screenshotDir)
 	log.Printf("👤 User: %s", userID)
 	log.Printf("💻 OS: %s", runtime.GOOS)
 
-	// Функция скриншота
+	// Функция скриншота и отправки в RabbitMQ
 	job := func() {
 		title := getWindowTitle()
 		log.Printf("📸 Taking screenshot... (window: %s)", title)
@@ -113,6 +151,34 @@ func main() {
 
 		log.Printf("✅ Saved: %s", path)
 		log.Printf("📊 Size: %d bytes", len(base64img))
+
+		// ===== ОТПРАВКА В RABBITMQ =====
+		msg := ScreenshotData{
+			UserID:      userID,
+			Timestamp:   time.Now(),
+			ImageBase64: base64img,
+			WindowTitle: title,
+			ProcessName: "macOS",
+		}
+
+		body, _ := json.Marshal(msg)
+
+		err = ch.Publish(
+			"",     // exchange
+			q.Name, // routing key (имя очереди)
+			false,  // mandatory
+			false,  // immediate
+			amqp.Publishing{
+				ContentType:  "application/json",
+				Body:         body,
+				DeliveryMode: amqp.Persistent, // сохранять на диск
+			})
+
+		if err != nil {
+			log.Println("❌ Failed to send to RabbitMQ:", err)
+		} else {
+			log.Println("📤 Sent to RabbitMQ")
+		}
 	}
 
 	// Первый сразу

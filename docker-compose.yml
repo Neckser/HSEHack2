@@ -1,35 +1,37 @@
 version: '3.8'
 
 services:
-  # ----- RabbitMQ временно отключен -----
-  # rabbitmq:
-  #   image: rabbitmq:3-management-alpine
-  #   ports:
-  #     - "5672:5672"
-  #     - "15672:15672"
-  #   networks:
-  #     - hack-net
-
-  screener:
-    build: ./services/screener
-    # depends_on:      # <-- закомментировано
-    #   - rabbitmq      # <-- закомментировано
-    environment:
-      # - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672  # <-- закомментировано
-      - CAPTURE_INTERVAL=5m
-      - USER_ID=${USER_ID:-hacker}
-    volumes:
-      - ./screenshots:/app/screenshots
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
     networks:
-      - hack-net
+      - bully-network
+    healthcheck:
+      test: ["CMD", "rabbitmqctl", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
 
-  # analyzer:
-  #   build: ./services/analyzer
-  #   depends_on: [rabbitmq]
-
-  # notifier:
-  #   build: ./services/notifier
-  #   depends_on: [rabbitmq]
+  analyzer:
+    build: ./services/analyzer
+    container_name: analyzer
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      - RABBITMQ_URL=${RABBITMQ_URL_DOCKER}  # берем из .env
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - MODEL_NAME=${MODEL_NAME}
+      - POLL_INTERVAL_SECONDS=${POLL_INTERVAL_SECONDS}
+      - DEBUG=${DEBUG}
+    networks:
+      - bully-network
+    restart: unless-stopped
 
 networks:
-  hack-net:
+  bully-network:
+    driver: bridge

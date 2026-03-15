@@ -1,39 +1,36 @@
 import os
-import time
+import json
 import base64
+import time
 from pathlib import Path
 from collections import deque
-
 from openai import OpenAI
-
+import pika
 
 # =========================
-# ЗАПОЛНИ ЭТИ ПОЛЯ
+# НАСТРОЙКИ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ
 # =========================
 
-OPENROUTER_API_KEY = ""
-
-MODEL_NAME = "openai/gpt-5.4"
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+MODEL_NAME = os.getenv("MODEL_NAME", "openai/gpt-4o")
+RABBITMQ_URL = os.getenv("RABBITMQ_URL", "amqp://guest:guest@rabbitmq:5672")
+MEMORY_SIZE = int(os.getenv("MEMORY_SIZE", "5"))
+DEBUG = os.getenv("DEBUG", "true").lower() == "true"
 
 YOUR_PROMPT = """
 - определи, что происходит на экране
 - учитывай предыдущие 4-5 скриншотов как контекст
--Ты язвительный AI-комментатор. Тон: саркастичный, холодный, пассивно-агрессивный, и агрессивый.
+- Ты язвительный AI-комментатор. Тон: саркастичный, холодный, пассивно-агрессивный, и агрессивный.
 Комментарии короткие, 1–2 фразы. Фокусируйся на действиях и ошибках, следи за тем, чтобы пользователь был всегда продуктивен. Хейти его если он не знает каких-то базовых вещей. Используй мат, но цензурируй его звездочками.
 Используй мемы для язвительности.
 - не раскрывай пароли, токены, номера карт
 """
 
-
 # =========================
-# НАСТРОЙКИ
+# ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ
 # =========================
-
-SCREENSHOT_DIR = "screens"
-POLL_INTERVAL_SECONDS = 15
-MEMORY_SIZE = 5
-DEBUG = True
-
+# ТЕПЕРЬ ХРАНИМ DATA URL, А НЕ ПУТИ К ФАЙЛАМ!
+memory_store = deque(maxlen=MEMORY_SIZE)
 
 # =========================
 # КЛИЕНТ OPENROUTER
@@ -75,6 +72,7 @@ def guess_mime_type(path: str) -> str:
 
 
 def image_to_data_url(image_path: str) -> str:
+    """Конвертирует файл в data URL"""
     mime_type = guess_mime_type(image_path)
 
     with open(image_path, "rb") as f:
@@ -83,21 +81,28 @@ def image_to_data_url(image_path: str) -> str:
     return f"data:{mime_type};base64,{encoded}"
 
 
-def get_latest_image_path(folder: str) -> str | None:
-    folder_path = Path(folder)
-
-    if not folder_path.exists():
-        return None
-
-    files = [f for f in folder_path.iterdir() if f.is_file() and is_image_file(f)]
-    if not files:
-        return None
-
-    files.sort(key=lambda x: x.stat().st_mtime)
-    return str(files[-1])
+def base64_to_data_url(base64_data: str) -> str:
+    """Конвертирует base64 строку в data URL (для хранения в памяти)"""
+    return f"data:image/png;base64,{base64_data}"
 
 
-def build_messages(current_image_path: str, memory_paths: list[str]) -> list[dict]:
+def save_temp_image(base64_data: str, timestamp: int) -> str:
+    """Сохраняет base64 во временный файл и возвращает путь"""
+    temp_dir = Path("/tmp/screenshots")
+    temp_dir.mkdir(exist_ok=True, parents=True)
+    
+    filename = f"screen_{timestamp}.png"
+    filepath = temp_dir / filename
+    
+    image_data = base64.b64decode(base64_data)
+    with open(filepath, "wb") as f:
+        f.write(image_data)
+    
+    return str(filepath)
+
+
+def build_messages(current_image_path: str, memory_urls: list[str]) -> list[dict]:
+    """Строит сообщения для API, используя data URL из памяти"""
     content = []
 
     content.append({
@@ -105,16 +110,16 @@ def build_messages(current_image_path: str, memory_paths: list[str]) -> list[dic
         "text": YOUR_PROMPT.strip()
     })
 
-    if memory_paths:
+    if memory_urls:
         content.append({
             "type": "text",
             "text": (
-                f"Ниже приложены {len(memory_paths)} предыдущих скриншотов. "
+                f"Ниже приложены {len(memory_urls)} предыдущих скриншотов. "
                 f"Используй их только как контекст, чтобы понять динамику происходящего."
             )
         })
 
-        for idx, old_path in enumerate(memory_paths, start=1):
+        for idx, old_url in enumerate(memory_urls, start=1):
             content.append({
                 "type": "text",
                 "text": f"Предыдущий скриншот #{idx}"
@@ -122,7 +127,7 @@ def build_messages(current_image_path: str, memory_paths: list[str]) -> list[dic
             content.append({
                 "type": "image_url",
                 "image_url": {
-                    "url": image_to_data_url(old_path)
+                    "url": old_url  # Используем URL из памяти
                 }
             })
 
@@ -133,7 +138,7 @@ def build_messages(current_image_path: str, memory_paths: list[str]) -> list[dic
     content.append({
         "type": "image_url",
         "image_url": {
-            "url": image_to_data_url(current_image_path)
+            "url": image_to_data_url(current_image_path)  # Текущий из файла
         }
     })
 
@@ -145,8 +150,9 @@ def build_messages(current_image_path: str, memory_paths: list[str]) -> list[dic
     ]
 
 
-def call_model(current_image_path: str, memory_paths: list[str]) -> str:
-    messages = build_messages(current_image_path, memory_paths)
+def call_model(current_image_path: str, memory_urls: list[str]) -> str:
+    """Вызывает модель с учетом истории из memory_urls"""
+    messages = build_messages(current_image_path, memory_urls)
 
     response = client.chat.completions.create(
         model=MODEL_NAME,
@@ -162,62 +168,126 @@ def call_model(current_image_path: str, memory_paths: list[str]) -> str:
     return text.strip()
 
 
-def analyze_single_file(image_path: str, memory_store: deque) -> str:
-    previous_images = list(memory_store)
-    result = call_model(image_path, previous_images)
-    memory_store.append(image_path)
+def analyze_single_file(image_path: str, memory_urls: deque, current_base64: str) -> str:
+    """
+    Анализирует файл с учетом истории.
+    memory_urls содержит data URL предыдущих скриншотов
+    """
+    previous_urls = list(memory_urls)
+    result = call_model(image_path, previous_urls)
+    
+    # Добавляем текущий скриншот в историю как data URL (НЕ путь к файлу!)
+    current_url = base64_to_data_url(current_base64)
+    memory_urls.append(current_url)
+    
     return result
 
 
-def watch_folder():
-    ensure_api_key()
+# =========================
+# ОБРАБОТЧИК СООБЩЕНИЙ ИЗ RABBITMQ
+# =========================
 
-    memory_store = deque(maxlen=MEMORY_SIZE)
-    last_seen_path = None
-
-    print(f"Слежу за папкой: {SCREENSHOT_DIR}")
-    print(f"Модель: {MODEL_NAME}")
-    print(f"Интервал: {POLL_INTERVAL_SECONDS} сек.")
-    print(f"Память: {MEMORY_SIZE} скриншотов")
-    print("-" * 50)
-
-    while True:
+def process_rabbit_message(ch, method, properties, body):
+    """Обработчик сообщений из RabbitMQ"""
+    global memory_store
+    
+    try:
+        # Получаем данные от скринера
+        data = json.loads(body)
+        
+        print(f"\n📥 Получен скриншот от {data.get('user_id', 'unknown')}")
+        print(f"🪟 Окно: {data.get('window_title', 'unknown')}")
+        
+        # Сохраняем временный файл (только для текущего анализа)
+        timestamp = int(time.time())
+        image_path = save_temp_image(data['image_base64'], timestamp)
+        
+        # Анализируем через OpenRouter (передаем и base64 для истории)
+        print("🤔 Анализирую...")
+        result = analyze_single_file(image_path, memory_store, data['image_base64'])
+        
+        print(f"💬 Результат: {result}")
+        
+        # Отправляем результат в очередь results для notifier
         try:
-            latest = get_latest_image_path(SCREENSHOT_DIR)
-
-            if latest is None:
-                log("В папке нет скриншотов.")
-            elif latest != last_seen_path:
-                print(f"\n[NEW] {latest}")
-                answer = analyze_single_file(latest, memory_store)
-                print("[MODEL]", answer)
-                last_seen_path = latest
-            else:
-                log("Новых файлов нет.")
-
+            # Создаем отдельный канал для отправки
+            result_ch = ch.connection.channel()
+            result_ch.queue_declare(queue='results', durable=True)
+            
+            result_data = {
+                'user_id': data.get('user_id'),
+                'message': result,
+                'timestamp': timestamp,
+                'window_title': data.get('window_title')
+            }
+            
+            result_ch.basic_publish(
+                exchange='',
+                routing_key='results',
+                body=json.dumps(result_data),
+                properties=pika.BasicProperties(
+                    content_type='application/json',
+                    delivery_mode=2  # persistent
+                )
+            )
+            result_ch.close()
+            print("📤 Результат отправлен в очередь results")
+            
         except Exception as e:
-            print("[ERROR]", repr(e))
+            print(f"[ERROR] Ошибка отправки результата: {e}")
+        
+        # Удаляем временный файл (он больше не нужен)
+        try:
+            os.remove(image_path)
+            print(f"🗑️ Временный файл удален")
+        except Exception as e:
+            print(f"⚠️ Не удалось удалить файл: {e}")
+        
+        # Подтверждаем обработку сообщения
+        ch.basic_ack(delivery_tag=method.delivery_tag)
+        
+    except Exception as e:
+        print(f"[ERROR] {e}")
+        import traceback
+        traceback.print_exc()
+        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
 
-        time.sleep(POLL_INTERVAL_SECONDS)
 
-
-def test_one_file(image_path: str):
-    ensure_api_key()
-
-    if not Path(image_path).exists():
-        raise FileNotFoundError(f"Файл не найден: {image_path}")
-
-    memory_store = deque(maxlen=MEMORY_SIZE)
-    answer = analyze_single_file(image_path, memory_store)
-
-    print("\n=== RESULT ===")
-    print(answer)
-
+# =========================
+# ЗАПУСК
+# =========================
 
 if __name__ == "__main__":
-    # Для теста одного файла:
-    #test_one_file("screens/screen.png")
-
-    # Для постоянного отслеживания папки:
-    #
-    watch_folder()
+    ensure_api_key()
+    
+    print(f"🔌 Подключение к RabbitMQ: {RABBITMQ_URL}")
+    
+    try:
+        # Подключаемся к RabbitMQ
+        params = pika.URLParameters(RABBITMQ_URL)
+        connection = pika.BlockingConnection(params)
+        channel = connection.channel()
+        
+        # Объявляем очереди
+        channel.queue_declare(queue='screenshots', durable=True)
+        channel.queue_declare(queue='results', durable=True)
+        
+        # Берем по одному сообщению
+        channel.basic_qos(prefetch_count=1)
+        
+        # Подписываемся на очередь скриншотов
+        channel.basic_consume(
+            queue='screenshots',
+            on_message_callback=process_rabbit_message
+        )
+        
+        print("🚀 Analyzer запущен. Ожидание скриншотов из RabbitMQ...")
+        print("-" * 50)
+        
+        # Начинаем слушать
+        channel.start_consuming()
+        
+    except KeyboardInterrupt:
+        print("\n🛑 Остановлен")
+    except Exception as e:
+        print(f"❌ Ошибка: {e}")
