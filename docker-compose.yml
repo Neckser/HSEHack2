@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  # ----- RabbitMQ временно отключен -----
+  # rabbitmq:
+  #   image: rabbitmq:3-management-alpine
+  #   ports:
+  #     - "5672:5672"
+  #     - "15672:15672"
+  #   networks:
+  #     - hack-net
+
+  screener:
+    build: ./services/screener
+    # depends_on:      # <-- закомментировано
+    #   - rabbitmq      # <-- закомментировано
+    environment:
+      # - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672  # <-- закомментировано
+      - CAPTURE_INTERVAL=5m
+      - USER_ID=${USER_ID:-hacker}
+    volumes:
+      - ./screenshots:/app/screenshots
+    networks:
+      - hack-net
+
+  # analyzer:
+  #   build: ./services/analyzer
+  #   depends_on: [rabbitmq]
+
+  # notifier:
+  #   build: ./services/notifier
+  #   depends_on: [rabbitmq]
+
+networks:
+  hack-net:
