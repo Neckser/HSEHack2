@@ -3,3 +3,4 @@ logs
 screenshots/
 *.jpeg
 .env
+.DS_Store
